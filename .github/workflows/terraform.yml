@@ -27,6 +27,12 @@ jobs:
     # deliberate GitHub security default, not a bug; see readme.md.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Cancel a superseded plan when new commits land on the same PR branch —
+    # otherwise two overlapping runs can race on the same state's S3 lock and
+    # leave an orphaned lock behind when the older run gets killed mid-plan.
+    concurrency:
+      group: tf-plan-${{ github.head_ref }}-${{ matrix.environment }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       # Scoped to develop only for now. Add staging/production back to this
@@ -169,6 +175,12 @@ jobs:
     # create this).
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Never cancel an in-flight apply — a second push to main while one is
+    # running queues behind it instead of racing/killing it mid-apply, which
+    # is what actually caused the stale S3 state lock we hit on 2026-07-31.
+    concurrency:
+      group: tf-apply-${{ matrix.environment }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 1
