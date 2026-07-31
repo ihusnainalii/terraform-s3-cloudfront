@@ -5,6 +5,18 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options:
+          - develop
+      confirm:
+        description: "Type the environment name exactly to confirm destruction"
+        required: true
+        type: string
 
 permissions:
   id-token: write
@@ -240,6 +252,64 @@ jobs:
                 exit 1
                 ;;
             esac
+            popd > /dev/null
+            echo "::endgroup::"
+          done
+
+  destroy:
+    # Manual only — never fires on push/pull_request. Requires typing the
+    # environment name into the `confirm` input as a deliberate guardrail
+    # against destroying infrastructure by an accidental workflow_dispatch
+    # click. Ties to the same GitHub Environment as `apply` so any
+    # required-reviewer protection rule applies here too.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    # Shares the apply job's concurrency group so a destroy can never race
+    # an in-flight apply (or another destroy) against the same environment.
+    concurrency:
+      group: tf-apply-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Verify confirmation input matches environment
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "${{ github.event.inputs.environment }}" ]; then
+            echo "::error::Confirmation text '${{ github.event.inputs.confirm }}' does not match environment '${{ github.event.inputs.environment }}'. Aborting — nothing was destroyed."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64" -o terragrunt
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/terragrunt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Reverse dependency order: cloudfront depends on s3 + acm, so it must
+      # be destroyed first, or destroying s3/acm first leaves cloudfront
+      # referencing resources that no longer exist.
+      - name: Terragrunt destroy (reverse dependency order)
+        working-directory: environment/${{ github.event.inputs.environment }}
+        run: |
+          set -e
+          for unit in cloudfront acm s3; do
+            echo "::group::${unit}"
+            pushd "$unit" > /dev/null
+            terragrunt destroy --non-interactive -auto-approve
             popd > /dev/null
             echo "::endgroup::"
           done

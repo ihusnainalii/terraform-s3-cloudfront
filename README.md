@@ -92,6 +92,16 @@ intentional, not a bug.
   named `develop` — add `staging`/`production` back to the matrix (and,
   eventually, a required-reviewer protection rule on the `production`
   Environment) when those are ready to deploy.
+- **Manual destroy** (`workflow_dispatch` only — never fires on `push` or
+  `pull_request`): tears down every unit in the selected environment, in
+  reverse dependency order (`cloudfront` → `acm` → `s3`, since `cloudfront`
+  depends on the other two). Requires typing the environment name into the
+  `confirm` input exactly, or the job aborts before touching anything — a
+  deliberate guardrail against an accidental dispatch. Run it from the
+  Actions tab: select this workflow → "Run workflow" → choose the
+  environment → type its name again in `confirm`. Shares the `apply` job's
+  concurrency group, so it can never race an in-flight apply (or another
+  destroy) against the same environment.
 
 ## PR → merge flow
 
