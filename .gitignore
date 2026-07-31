@@ -1,0 +1,12 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+plan_output.txt
+pr_comment_body.md
+.terragrunt-cache/
+crash.log
+crash.*.log
+.claude
+CLAUDE.md
