@@ -29,8 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Scoped to develop only for now. Add staging/production back to this
+      # list once we're ready to deploy those environments too.
       matrix:
-        environment: [develop, staging, production]
+        environment: [develop]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -159,17 +161,19 @@ jobs:
 
   apply:
     # Push to main (i.e. a PR merge, assuming main is branch-protected against
-    # direct pushes) — one environment at a time (develop -> staging -> production).
-    # `environment:` ties this job to a GitHub Environment so `production` can
-    # carry a required-reviewer protection rule (configured manually in repo
-    # settings — Terraform/Terragrunt cannot create this).
+    # direct pushes). Scoped to develop only for now — add staging/production
+    # back to the matrix below once we're ready to deploy those environments
+    # too. `environment:` ties this job to a GitHub Environment so
+    # `production` can later carry a required-reviewer protection rule
+    # (configured manually in repo settings — Terraform/Terragrunt cannot
+    # create this).
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
-        environment: [develop, staging, production]
+        environment: [develop]
     environment: ${{ matrix.environment }}
     steps:
       - name: Checkout

@@ -68,25 +68,30 @@ intentional, not a bug.
 
 ## CI/CD model
 
+> **Currently scoped to `develop` only.** The workflow's environment matrix is
+> `[develop]` in both jobs — `staging` and `production` modules/Terragrunt
+> units exist in the repo but the pipeline does not touch them yet. To bring
+> an environment online, add it back to the `matrix.environment` list in
+> `.github/workflows/terraform.yml` (both the `validate-and-plan` and `apply`
+> jobs).
+
 - **Pull requests targeting `main`**: `terraform fmt -check`, `terragrunt
   validate --all`, `tflint`, then a **per-unit** `terragrunt plan
-  -detailed-exitcode` for `s3`, `acm`, `cloudfront` in each of the three
-  environments. The plan result is posted/updated as a single PR comment per
-  environment — units with no diff are listed as "no changes" (one line, no
-  plan dump); only units with an actual diff show their full plan output.
-  Nothing is ever applied from a PR. Note: PRs from forks don't receive repo
-  secrets/OIDC on the `pull_request` event by default (a GitHub security
-  default) — this job will fail auth for fork PRs.
+  -detailed-exitcode` for `s3`, `acm`, `cloudfront` in `develop`. The plan
+  result is posted/updated as a single PR comment — units with no diff are
+  listed as "no changes" (one line, no plan dump); only units with an actual
+  diff show their full plan output. Nothing is ever applied from a PR. Note:
+  PRs from forks don't receive repo secrets/OIDC on the `pull_request` event
+  by default (a GitHub security default) — this job will fail auth for fork
+  PRs.
 - **Push to `main`** (i.e. a PR merge, assuming `main` is branch-protected
-  against direct pushes): for each environment, in order (`develop` →
-  `staging` → `production`), each unit (`s3`, `acm`, `cloudfront`) is planned
-  individually and **only applied if that unit's plan shows a change** — a
-  unit with nothing to change is skipped entirely, never run through `apply`
-  just to no-op. The `production` job runs under the GitHub Environment named
-  `production` — add a required-reviewer protection rule to that Environment
-  in repo settings if you want a manual approval gate before production
-  applies (Terraform/Terragrunt can't configure this; it's a one-time manual
-  step in GitHub repo settings).
+  against direct pushes): for `develop`, each unit (`s3`, `acm`, `cloudfront`)
+  is planned individually and **only applied if that unit's plan shows a
+  change** — a unit with nothing to change is skipped entirely, never run
+  through `apply` just to no-op. The job runs under the GitHub Environment
+  named `develop` — add `staging`/`production` back to the matrix (and,
+  eventually, a required-reviewer protection rule on the `production`
+  Environment) when those are ready to deploy.
 
 ## PR → merge flow
 
@@ -102,9 +107,10 @@ sequenceDiagram
     Dev->>Branch: commit changes (modules/ or environment/)
     Dev->>PR: open PR targeting main
     PR->>CI: pull_request event
-    CI->>CI: terraform fmt -check, tflint
-    CI->>CI: terragrunt validate --all
-    loop each environment (develop, staging, production)
+    CI->>CI: fmt — terraform fmt -check -recursive
+    CI->>CI: lint — tflint --recursive
+    CI->>CI: validate — terragrunt validate --all
+    loop develop only (staging/production not yet in the matrix)
         loop each unit (s3, acm, cloudfront)
             CI->>AWS: terragrunt plan -detailed-exitcode
             AWS-->>CI: 0 = no changes / 2 = changes / 1 = error
@@ -115,7 +121,7 @@ sequenceDiagram
     Dev->>PR: reviewer approves
     PR->>Main: merge (squash/merge commit)
     Main->>CI: push event on main
-    loop develop, then staging, then production (max-parallel 1)
+    loop develop only (staging/production not yet in the matrix)
         loop each unit (s3, acm, cloudfront)
             CI->>AWS: terragrunt plan -detailed-exitcode
             alt changes detected
