@@ -1,0 +1,229 @@
+name: S3 + CloudFront Terraform Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+  DOMAIN_NAME: ${{ secrets.DOMAIN_NAME }}
+  HOSTED_ZONE_ID: ${{ secrets.HOSTED_ZONE_ID }}
+  TERRAFORM_VERSION: "1.15.8"
+  TERRAGRUNT_VERSION: "1.1.1"
+
+jobs:
+  validate-and-plan:
+    # Pull requests targeting main: format/lint/validate/plan only. Never applies.
+    # NOTE: PRs from forks don't get repo secrets/OIDC by default on the
+    # `pull_request` event — this job will fail auth for fork PRs. That's a
+    # deliberate GitHub security default, not a bug; see readme.md.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [develop, staging, production]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64" -o terragrunt
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/terragrunt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        run: tflint --recursive
+
+      - name: Terragrunt validate
+        working-directory: environment/${{ matrix.environment }}
+        run: terragrunt validate --all --non-interactive
+
+      # Plans each unit individually (not run-all) so a unit with zero diff
+      # can be reported as "no changes" instead of dumping a full plan for
+      # something that isn't going to change. -detailed-exitcode: 0 = no
+      # changes, 2 = changes, 1 = real error (fails the step immediately).
+      - name: Terragrunt plan (per unit)
+        id: plan
+        working-directory: environment/${{ matrix.environment }}
+        continue-on-error: true
+        run: |
+          set -e
+          BODY_FILE="$(pwd)/pr_comment_body.md"
+          echo "### Terraform Plan — \`${{ matrix.environment }}\`" > "$BODY_FILE"
+          echo >> "$BODY_FILE"
+
+          for unit in s3 acm cloudfront; do
+            echo "::group::${unit}"
+            pushd "$unit" > /dev/null
+            set +e
+            terragrunt plan -detailed-exitcode --non-interactive -no-color > plan_output.txt 2>&1
+            code=$?
+            set -e
+            popd > /dev/null
+            echo "::endgroup::"
+
+            if [ "$code" -eq 0 ]; then
+              echo "- **${unit}**: no changes" >> "$BODY_FILE"
+            elif [ "$code" -eq 2 ]; then
+              {
+                echo "<details><summary><strong>${unit}</strong>: changes detected</summary>"
+                echo
+                echo '```hcl'
+                cat "${unit}/plan_output.txt"
+                echo '```'
+                echo "</details>"
+                echo
+              } >> "$BODY_FILE"
+            else
+              {
+                echo "- **${unit}**: plan FAILED"
+                echo '```'
+                cat "${unit}/plan_output.txt"
+                echo '```'
+              } >> "$BODY_FILE"
+              exit 1
+            fi
+          done
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'environment/${{ matrix.environment }}/pr_comment_body.md';
+            let body = fs.existsSync(path)
+              ? fs.readFileSync(path, 'utf8')
+              : `### Terraform Plan — \`${{ matrix.environment }}\`\n\n(no output captured — the plan step likely failed before writing anything)`;
+
+            if (body.length > 60000) {
+              body = body.slice(0, 60000) + '\n\n... (truncated)';
+            }
+
+            const marker = `<!-- terraform-plan-${{ matrix.environment }} -->`;
+            body = `${marker}\n${body}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail job if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    # Push to main (i.e. a PR merge, assuming main is branch-protected against
+    # direct pushes) — one environment at a time (develop -> staging -> production).
+    # `environment:` ties this job to a GitHub Environment so `production` can
+    # carry a required-reviewer protection rule (configured manually in repo
+    # settings — Terraform/Terragrunt cannot create this).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        environment: [develop, staging, production]
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64" -o terragrunt
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/terragrunt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Applies each unit individually (not run-all) and only if that unit's
+      # own plan shows a diff — a unit with nothing to change is skipped
+      # entirely, it is never "applied" just to no-op.
+      - name: Terragrunt plan + apply (per unit, changes only)
+        working-directory: environment/${{ matrix.environment }}
+        run: |
+          set -e
+          for unit in s3 acm cloudfront; do
+            echo "::group::${unit}"
+            pushd "$unit" > /dev/null
+            set +e
+            terragrunt plan -detailed-exitcode --non-interactive -no-color > plan_output.txt 2>&1
+            code=$?
+            set -e
+
+            case "$code" in
+              0)
+                echo "${unit}: no changes — skipping apply"
+                ;;
+              2)
+                echo "${unit}: changes detected — applying"
+                terragrunt apply --non-interactive -auto-approve
+                ;;
+              *)
+                echo "${unit}: terragrunt plan failed"
+                cat plan_output.txt
+                popd > /dev/null
+                echo "::endgroup::"
+                exit 1
+                ;;
+            esac
+            popd > /dev/null
+            echo "::endgroup::"
+          done
